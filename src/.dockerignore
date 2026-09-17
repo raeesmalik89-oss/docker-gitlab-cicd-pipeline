@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log
+.git
+.gitlab-ci.yml
+pipelines
+scripts
+docker-compose*.yml
+*.md

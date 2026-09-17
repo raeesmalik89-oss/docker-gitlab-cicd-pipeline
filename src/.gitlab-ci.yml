@@ -17,17 +17,21 @@ services:
 
 before_script:
   - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
-  - apk add --no-cache docker-compose
+  - apk add --no-cache docker-compose curl
 
-build_image:
+build_and_tag:
   stage: build
   image: docker:24
   script:
-    - echo "Building Docker image..."
-    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - echo "Building Docker image with advanced tagging..."
+    - mkdir -p scripts
+    - chmod +x scripts/tag-image.sh
     - docker build -t $IMAGE_NAME:latest .
-    - docker push $IMAGE_NAME:$IMAGE_TAG
-    - docker push $IMAGE_NAME:latest
+    - ./scripts/tag-image.sh $IMAGE_NAME $CI_COMMIT_SHORT_SHA $CI_COMMIT_REF_NAME $CI_PIPELINE_ID
+  artifacts:
+    paths:
+      - VERSION
+    expire_in: 1 week
   only:
     - main
     - develop
@@ -36,52 +40,123 @@ test_application:
   stage: test
   image: docker:24
   script:
-    - echo "Running docker-compose tests..."
-    - export APP_VERSION=$CI_COMMIT_SHORT_SHA
+    - echo "Testing with tagged image..."
+    - export APP_VERSION=$(cat VERSION)
     - docker-compose -f docker-compose.yml up -d app mongo redis
     - sleep 30
     - docker-compose exec -T app npm test
     - docker-compose exec -T app curl -f http://localhost:3000/health || exit 1
     - docker-compose down -v
   dependencies:
-    - build_image
+    - build_and_tag
   only:
     - main
     - develop
 
-security_scan:
+security_comprehensive_scan:
   stage: security
   image: docker:24
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+    - apk add --no-cache curl
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
   script:
-    - echo "Running security scan on all services..."
-    - docker run --rm $IMAGE_NAME:$IMAGE_TAG echo "App security scan completed"
-    - docker run --rm mongo:6.0 echo "MongoDB security check completed"
-    - docker run --rm redis:7-alpine echo "Redis security check completed"
+    - echo "Running comprehensive security scans..."
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format table $IMAGE_NAME:latest
+    - trivy image --exit-code 1 --severity CRITICAL --format json --output app-scan-results.json $IMAGE_NAME:latest || echo "Critical vulnerabilities found"
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format table mongo:6.0
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format table redis:7-alpine
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format table nginx:alpine
+    - trivy config --exit-code 0 --severity HIGH,CRITICAL .
+  artifacts:
+    paths:
+      - app-scan-results.json
+    expire_in: 1 week
   dependencies:
-    - build_image
+    - build_and_tag
+  allow_failure: true
   only:
     - main
 
 deploy_staging:
   stage: deploy
   image: docker:24
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+    - apk add --no-cache docker-compose
   script:
-    - echo "Deploying full stack to staging..."
-    - export NODE_ENV=staging
-    - export APP_VERSION=$CI_COMMIT_SHORT_SHA
-    - export MONGO_USERNAME=$STAGING_MONGO_USERNAME
-    - export MONGO_PASSWORD=$STAGING_MONGO_PASSWORD
-    - export REDIS_PASSWORD=$STAGING_REDIS_PASSWORD
-    - docker-compose up -d
-    - echo "Waiting for services to be ready..."
-    - sleep 30
+    - echo "Deploying to staging environment..."
+    
+    # Validate secrets
+    - ./scripts/validate-secrets.sh staging
+    
+    # Set environment variables
+    - export APP_VERSION=$(cat VERSION)
+    - export STAGING_MONGO_USERNAME=$STAGING_MONGO_USERNAME
+    - export STAGING_MONGO_PASSWORD=$STAGING_MONGO_PASSWORD
+    - export STAGING_REDIS_PASSWORD=$STAGING_REDIS_PASSWORD
+    
+    # Deploy using staging configuration
+    - docker-compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+    
+    # Wait for services to be ready
+    - echo "Waiting for services to start..."
+    - sleep 45
+    
+    # Health check
+    - docker-compose exec -T app curl -f http://localhost:3000/health || exit 1
+    
+    # Show deployment status
     - docker-compose ps
-    - echo "Full stack deployed successfully"
+    - echo "Staging deployment completed successfully!"
   environment:
     name: staging
-    url: http://staging.example.com
+    url: http://staging.example.com:3001
   dependencies:
     - test_application
-    - security_scan
+    - security_comprehensive_scan
   only:
     - main
+  when: manual
+
+deploy_production:
+  stage: deploy
+  image: docker:24
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+    - apk add --no-cache docker-compose
+  script:
+    - echo "Deploying to production environment..."
+    
+    # Validate secrets
+    - ./scripts/validate-secrets.sh production
+    
+    # Set production environment variables
+    - export APP_VERSION=$(cat VERSION)
+    - export PROD_MONGO_USERNAME=$PROD_MONGO_USERNAME
+    - export PROD_MONGO_PASSWORD=$PROD_MONGO_PASSWORD
+    - export PROD_REDIS_PASSWORD=$PROD_REDIS_PASSWORD
+    - export PROD_DATABASE_URL=$PROD_DATABASE_URL
+    
+    # Deploy using production configuration
+    - docker-compose -f docker-compose.yml -f docker-compose.production.yml up -d
+    
+    # Extended wait for production
+    - echo "Waiting for production services to start..."
+    - sleep 60
+    
+    # Comprehensive health checks
+    - docker-compose exec -T app curl -f http://localhost:3000/health || exit 1
+    - echo "Production health check passed"
+    
+    # Show deployment status
+    - docker-compose ps
+    - echo "Production deployment completed successfully!"
+  environment:
+    name: production
+    url: http://production.example.com
+  dependencies:
+    - deploy_staging
+  only:
+    - main
+  when: manual

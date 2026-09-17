@@ -1,43 +1,70 @@
+
 #!/bin/bash
+
+# Advanced Docker image tagging script
 set -e
 
-IMAGE=$1
+# Variables
+IMAGE_NAME=${1:-$CI_REGISTRY_IMAGE}
+COMMIT_SHA=${2:-$CI_COMMIT_SHORT_SHA}
+BRANCH_NAME=${3:-$CI_COMMIT_REF_NAME}
+BUILD_NUMBER=${4:-$CI_PIPELINE_ID}
 
-if [ -z "$IMAGE" ]; then
-    echo "Usage: $0 <image-name>"
-    exit 1
-fi
+# Function to create semantic version tag
+create_semantic_tag() {
+    local version_file="VERSION"
+    if [ -f "$version_file" ]; then
+        VERSION=$(cat $version_file)
+    else
+        VERSION="1.0.0"
+    fi
+    
+    # Increment patch version for main branch
+    if [ "$BRANCH_NAME" = "main" ]; then
+        MAJOR=$(echo $VERSION | cut -d. -f1)
+        MINOR=$(echo $VERSION | cut -d. -f2)
+        PATCH=$(echo $VERSION | cut -d. -f3)
+        PATCH=$((PATCH + 1))
+        NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+        echo $NEW_VERSION > $version_file
+        echo $NEW_VERSION
+    else
+        echo "$VERSION-$BRANCH_NAME"
+    fi
+}
 
-echo "Creating multiple tags for image: $IMAGE"
+# Create tags
+SEMANTIC_TAG=$(create_semantic_tag)
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
-# Extract image name and tag
-IMAGE_NAME=$(echo "$IMAGE" | cut -d':' -f1)
-IMAGE_TAG=$(echo "$IMAGE" | cut -d':' -f2)
+echo "Creating multiple tags for image: $IMAGE_NAME"
 
-if [ -z "$IMAGE_TAG" ]; then
-    IMAGE_TAG="latest"
-fi
+# Tag with commit SHA
+docker tag $IMAGE_NAME:latest $IMAGE_NAME:$COMMIT_SHA
+echo "Tagged with commit SHA: $COMMIT_SHA"
 
-# Set target registry and namespace (modify these as needed)
-TARGET_REGISTRY=${DOCKER_REGISTRY:-"localhost:5000"}
-TARGET_NAMESPACE=${DOCKER_NAMESPACE:-"my-namespace"}
+# Tag with semantic version
+docker tag $IMAGE_NAME:latest $IMAGE_NAME:$SEMANTIC_TAG
+echo "Tagged with semantic version: $SEMANTIC_TAG"
 
-echo "Original image: $IMAGE"
-echo "Image name: $IMAGE_NAME"
-echo "Image tag: $IMAGE_TAG"
+# Tag with branch name
+docker tag $IMAGE_NAME:latest $IMAGE_NAME:$BRANCH_NAME
+echo "Tagged with branch name: $BRANCH_NAME"
 
-# Create multiple tags
-TAGS=(
-    "$TARGET_REGISTRY/$TARGET_NAMESPACE/$IMAGE_NAME:$IMAGE_TAG"
-    "$TARGET_REGISTRY/$TARGET_NAMESPACE/$IMAGE_NAME:latest"
-    "$TARGET_REGISTRY/$TARGET_NAMESPACE/$IMAGE_NAME:${IMAGE_TAG}-$(date +%Y%m%d)"
-)
+# Tag with timestamp
+docker tag $IMAGE_NAME:latest $IMAGE_NAME:$TIMESTAMP
+echo "Tagged with timestamp: $TIMESTAMP"
 
-for TAG in "${TAGS[@]}"; do
-    echo "Tagging: $IMAGE -> $TAG"
-    docker tag "$IMAGE" "$TAG"
-done
+# Tag with build number
+docker tag $IMAGE_NAME:latest $IMAGE_NAME:build-$BUILD_NUMBER
+echo "Tagged with build number: build-$BUILD_NUMBER"
 
-echo "All tags created successfully!"
-echo "Current tags for the image:"
-docker images | grep "$IMAGE_NAME"
+# Push all tags
+echo "Pushing all tags..."
+docker push $IMAGE_NAME:$COMMIT_SHA
+docker push $IMAGE_NAME:$SEMANTIC_TAG
+docker push $IMAGE_NAME:$BRANCH_NAME
+docker push $IMAGE_NAME:$TIMESTAMP
+docker push $IMAGE_NAME:build-$BUILD_NUMBER
+
+echo "All tags pushed successfully!"
